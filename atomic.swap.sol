@@ -38,6 +38,7 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
     error InvalidLeg();
     error InvalidSecret();
     error AlreadyMarked();
+    error Unauthorized();
 
     enum SwapStatus {
         None,
@@ -262,6 +263,14 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
     function revealSecret(bytes32 swapId, bytes32 secret) external {
         Swap storage s = _requireSwap(swapId);
 
+        // TSI-FPC-003 mitigation: only swap parties or a trusted executor may reveal.
+        // Prevents any third party from permanently bricking the refund paths.
+        if (
+            msg.sender != s.partyAControllerSnapshot &&
+            msg.sender != s.partyBControllerSnapshot &&
+            !hasRole(EXECUTOR_ROLE, msg.sender)
+        ) revert Unauthorized();
+
         if (s.status != SwapStatus.Active && s.status != SwapStatus.Revealed) revert WrongStatus();
         if (block.timestamp > s.revealDeadline) revert DeadlinePassed();
         if (sha256(abi.encodePacked(secret)) != s.hashlock) revert InvalidSecret();
@@ -278,7 +287,9 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
     {
         Swap storage s = _requireSwap(swapId);
 
-        if (s.status != SwapStatus.Revealed && s.status != SwapStatus.Active) revert WrongStatus();
+        // TSI-FPC-002 mitigation: releases require an on-chain secret reveal first.
+        // Removing Active from allowed statuses enforces the hashlock guarantee.
+        if (s.status != SwapStatus.Revealed) revert WrongStatus();
 
         if (leg == 0) {
             if (s.legAReleased) revert AlreadyMarked();
@@ -310,10 +321,14 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
         if (s.revealedSecret != bytes32(0)) revert WrongStatus();
 
         if (leg == 0) {
+            // TSI-FPC-004 mitigation: a leg that was released cannot also be refunded.
+            if (s.legAReleased) revert WrongStatus();
             if (block.timestamp < s.refundAtA) revert DeadlineNotReached();
             if (s.legARefunded) revert AlreadyMarked();
             s.legARefunded = true;
         } else if (leg == 1) {
+            // TSI-FPC-004 mitigation: same guard for leg B.
+            if (s.legBReleased) revert WrongStatus();
             if (block.timestamp < s.refundAtB) revert DeadlineNotReached();
             if (s.legBRefunded) revert AlreadyMarked();
             s.legBRefunded = true;
@@ -334,6 +349,9 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
         Swap storage s = _requireSwap(swapId);
 
         if (s.status != SwapStatus.Open) revert WrongStatus();
+        // TSI-FPC-001 mitigation: once any external-chain leg has been funded,
+        // cancellation is blocked. The refund path (markLegRefunded) handles recovery.
+        if (s.legAFunded || s.legBFunded) revert WrongStatus();
         if (
             block.timestamp <= s.consentDeadline &&
             block.timestamp <= s.legAFundDeadline &&
@@ -434,4 +452,3 @@ contract FastPathAtomicSwapCoordinator is AccessControl, EIP712 {
         if (s.status == SwapStatus.None) revert InvalidSwap();
     }
 }
-
